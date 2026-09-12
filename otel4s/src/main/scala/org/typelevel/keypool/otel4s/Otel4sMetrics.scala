@@ -19,17 +19,17 @@
  * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-package org.typelevel.keypool
+package org.typelevel.keypool.otel4s
 
 import java.util.concurrent.TimeUnit
 
 import cats.Monad
 import cats.effect.kernel.Resource
-import cats.syntax.functor._
-import cats.syntax.flatMap._
+import cats.syntax.flatMap.*
+import cats.syntax.functor.*
 import org.typelevel.keypool.internal.Metrics
 import org.typelevel.otel4s.Attributes
-import org.typelevel.otel4s.metrics.{BucketBoundaries, Meter}
+import org.typelevel.otel4s.metrics.{BucketBoundaries, MeterProvider}
 
 object Otel4sMetrics {
 
@@ -60,7 +60,7 @@ object Otel4sMetrics {
    * @param acquireDurationSecondsHistogramBuckets
    *   the histogram buckets for 'acquire.duration' histogram
    */
-  def provider[F[_]: Monad: Meter](
+  def provider[F[_]: Monad: MeterProvider](
       prefix: String = "keypool",
       attributes: Attributes = Attributes.empty,
       inUseDurationSecondsHistogramBuckets: BucketBoundaries = DefaultHistogramBuckets,
@@ -69,38 +69,40 @@ object Otel4sMetrics {
     new Metrics.Provider[F] {
       def get: F[Metrics[F]] =
         for {
-          idle <- Meter[F]
+          meter <- MeterProvider[F].meter(prefix).withVersion(BuildInfo.version).get
+
+          idle <- meter
             .upDownCounter[Long](s"$prefix.idle.current")
             .withUnit("{resource}")
             .withDescription("A current number of idle resources.")
             .create
 
-          inUse <- Meter[F]
+          inUse <- meter
             .upDownCounter[Long](s"$prefix.in_use.current")
             .withUnit("{resource}")
             .withDescription("A current number of resources in use.")
             .create
 
-          inUseDuration <- Meter[F]
-            .histogram[Long](s"$prefix.in_use.duration")
+          inUseDuration <- meter
+            .histogram[Double](s"$prefix.in_use.duration")
             .withUnit("s")
             .withDescription("For how long a resource is in use.")
             .withExplicitBucketBoundaries(inUseDurationSecondsHistogramBuckets)
             .create
 
-          acquiredTotal <- Meter[F]
+          acquiredTotal <- meter
             .counter[Long](s"$prefix.acquired.total")
             .withUnit("{resource}")
             .withDescription("A total number of acquired resources.")
             .create
 
-          acquireDuration <- Meter[F]
-            .histogram[Long](s"$prefix.acquire.duration")
+          acquireDuration <- meter
+            .histogram[Double](s"$prefix.acquire.duration")
             .withUnit("s")
             .withDescription("How long does it take to acquire a resource.")
             .withExplicitBucketBoundaries(acquireDurationSecondsHistogramBuckets)
             .create
-        } yield new Metrics[F] {
+        } yield new Metrics.Unsealed[F] {
           def idleInc: F[Unit] =
             idle.inc(attributes)
 

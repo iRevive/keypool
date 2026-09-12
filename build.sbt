@@ -65,6 +65,7 @@ lazy val otel4s = crossProject(JVMPlatform, JSPlatform, NativePlatform)
   .crossType(CrossType.Pure)
   .in(file("otel4s"))
   .dependsOn(core)
+  .enablePlugins(BuildInfoPlugin)
   .settings(commonSettings)
   .settings(
     name := "keypool-otel4s",
@@ -73,6 +74,11 @@ lazy val otel4s = crossProject(JVMPlatform, JSPlatform, NativePlatform)
     libraryDependencies ++= Seq(
       "org.typelevel" %%% "otel4s-core-metrics"        % otel4sV,
       "org.typelevel" %%% "otel4s-sdk-metrics-testkit" % otel4sSdkV % Test
+    ),
+    buildInfoPackage := "org.typelevel.keypool.otel4s",
+    buildInfoOptions += sbtbuildinfo.BuildInfoOption.PackagePrivate,
+    buildInfoKeys := Seq[BuildInfoKey](
+      "version" -> version.value
     ),
     mimaPreviousArtifacts ~= { _.filterNot(_.revision.startsWith("0.4")) }
   )
