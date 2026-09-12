@@ -72,7 +72,7 @@ lazy val otel4s = crossProject(JVMPlatform, JSPlatform, NativePlatform)
     crossScalaVersions := Seq(Scala213, Scala3),
     libraryDependencies ++= Seq(
       "org.typelevel" %%% "otel4s-core-metrics"        % otel4sV,
-      "org.typelevel" %%% "otel4s-sdk-metrics-testkit" % otel4sV % Test
+      "org.typelevel" %%% "otel4s-sdk-metrics-testkit" % otel4sSdkV % Test
     ),
     mimaPreviousArtifacts ~= { _.filterNot(_.revision.startsWith("0.4")) }
   )
@@ -86,7 +86,8 @@ lazy val docs = project
 val catsV = "2.13.0"
 val catsEffectV = "3.7.1"
 
-val otel4sV = "0.7.0"
+val otel4sV = "1.1.0"
+val otel4sSdkV = "0.19.2"
 
 val munitV = "1.3.6"
 val munitCatsEffectV = "2.2.0"
