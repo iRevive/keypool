@@ -24,7 +24,7 @@ package org.typelevel.keypool.internal
 import cats.Applicative
 import cats.effect.kernel.Resource
 
-private[keypool] trait Metrics[F[_]] {
+sealed trait Metrics[F[_]] {
 
   /**
    * Increments the number of idle resources.
@@ -58,7 +58,8 @@ private[keypool] trait Metrics[F[_]] {
 
 }
 
-private[keypool] object Metrics {
+object Metrics {
+  private[keypool] trait Unsealed[F[_]] extends Metrics[F]
 
   trait Provider[F[_]] {
     def get: F[Metrics[F]]
