@@ -183,10 +183,26 @@ class PoolMetricsSpec extends CatsEffectSuite {
 
   private def metricsProvider(implicit M: MeterProvider[IO]): Metrics.Provider[IO] =
     Otel4sMetrics.provider[IO](
-      "keypool",
-      Attributes(Attribute("pool.name", "test")),
-      HistogramBuckets,
-      HistogramBuckets
+      Otel4sMetrics.Config.default
+        .withConstAttributes(PoolAttributes)
+        .withInUseDurationInstrument(
+          Otel4sMetrics.InstrumentConfig.histogram(
+            name = InUseDuration,
+            timeUnit = java.util.concurrent.TimeUnit.SECONDS,
+            description = "For how long a resource is in use.",
+            attributes = Attributes.empty,
+            explicitBucketBoundaries = HistogramBuckets
+          )
+        )
+        .withAcquireDurationInstrument(
+          Otel4sMetrics.InstrumentConfig.histogram(
+            name = AcquireDuration,
+            timeUnit = java.util.concurrent.TimeUnit.SECONDS,
+            description = "How long does it take to acquire a resource.",
+            attributes = Attributes.empty,
+            explicitBucketBoundaries = HistogramBuckets
+          )
+        )
     )
 
   private def createTestkit: Resource[IO, MetricsTestkit[IO]] =

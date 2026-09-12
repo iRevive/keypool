@@ -57,7 +57,7 @@ lazy val core = crossProject(JVMPlatform, JSPlatform, NativePlatform)
         .exclude[DirectMissingMethodProblem]("org.typelevel.keypool.KeyPool#Builder.this"),
       // Introduced by #561, add durationBetweenEvictionRuns
       ProblemFilters
-        .exclude[DirectMissingMethodProblem]("org.typelevel.keypool.Pool#Builder.this"),
+        .exclude[DirectMissingMethodProblem]("org.typelevel.keypool.Pool#Builder.this")
     )
   )
 
@@ -72,8 +72,9 @@ lazy val otel4s = crossProject(JVMPlatform, JSPlatform, NativePlatform)
     startYear := Some(2024),
     crossScalaVersions := Seq(Scala213, Scala3),
     libraryDependencies ++= Seq(
-      "org.typelevel" %%% "otel4s-core-metrics"        % otel4sV,
-      "org.typelevel" %%% "otel4s-sdk-metrics-testkit" % otel4sSdkV % Test
+      "org.typelevel" %%% "otel4s-core-metrics"                 % otel4sV,
+      "org.typelevel" %%% "otel4s-semconv-metrics-experimental" % otel4sV    % Test,
+      "org.typelevel" %%% "otel4s-sdk-metrics-testkit"          % otel4sSdkV % Test
     ),
     buildInfoPackage := "org.typelevel.keypool.otel4s",
     buildInfoOptions += sbtbuildinfo.BuildInfoOption.PackagePrivate,
