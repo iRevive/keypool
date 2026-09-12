@@ -36,6 +36,7 @@ object Otel4sMetrics {
 
   /** Configuration for an emitted instrument. */
   sealed trait InstrumentConfig {
+
     /** Instrument name. */
     def name: String
 
@@ -45,20 +46,30 @@ object Otel4sMetrics {
     /** Instrument description. */
     def description: String
 
-    /** Attributes added to each measurement. */
-    def attributes: Attributes
   }
 
   object InstrumentConfig {
 
     /** Counter configuration. */
-    sealed trait Counter extends InstrumentConfig
+    sealed trait Counter extends InstrumentConfig {
+
+      /** Attributes added to each measurement. */
+      def attributes: Attributes
+    }
 
     /** Up-down counter configuration. */
-    sealed trait UpDownCounter extends InstrumentConfig
+    sealed trait UpDownCounter extends InstrumentConfig {
+
+      /** Attributes added to each measurement. */
+      def attributes: Attributes
+    }
 
     /** Duration histogram configuration. */
     sealed trait Histogram extends InstrumentConfig {
+
+      /** Attributes added to each measurement, based on how the measured resource use completed. */
+      def attributes: Resource.ExitCase => Attributes
+
       /** Unit used to record durations. */
       def timeUnit: TimeUnit
 
@@ -67,13 +78,13 @@ object Otel4sMetrics {
 
       final def unit: String =
         timeUnit match {
-          case TimeUnit.NANOSECONDS  => "ns"
+          case TimeUnit.NANOSECONDS => "ns"
           case TimeUnit.MICROSECONDS => "us"
           case TimeUnit.MILLISECONDS => "ms"
-          case TimeUnit.SECONDS      => "s"
-          case TimeUnit.MINUTES      => "min"
-          case TimeUnit.HOURS        => "h"
-          case TimeUnit.DAYS         => "d"
+          case TimeUnit.SECONDS => "s"
+          case TimeUnit.MINUTES => "min"
+          case TimeUnit.HOURS => "h"
+          case TimeUnit.DAYS => "d"
         }
     }
 
@@ -103,6 +114,16 @@ object Otel4sMetrics {
         attributes: Attributes,
         explicitBucketBoundaries: BucketBoundaries
     ): Histogram =
+      histogram(name, timeUnit, description, _ => attributes, explicitBucketBoundaries)
+
+    /** Creates a duration histogram configuration with exit-case-dependent attributes. */
+    def histogram(
+        name: String,
+        timeUnit: TimeUnit,
+        description: String,
+        attributes: Resource.ExitCase => Attributes,
+        explicitBucketBoundaries: BucketBoundaries
+    ): Histogram =
       HistogramImpl(name, timeUnit, description, attributes, explicitBucketBoundaries)
 
     private final case class CounterImpl(
@@ -123,7 +144,7 @@ object Otel4sMetrics {
         name: String,
         timeUnit: TimeUnit,
         description: String,
-        attributes: Attributes,
+        attributes: Resource.ExitCase => Attributes,
         explicitBucketBoundaries: BucketBoundaries
     ) extends Histogram
 
@@ -356,8 +377,16 @@ object Otel4sMetrics {
           }
         } yield new Metrics.Unsealed[F] {
 
-          private def attributes(instrument: InstrumentConfig): Attributes =
+          private def attributes(instrument: InstrumentConfig.Counter): Attributes =
             config.constAttributes ++ instrument.attributes
+
+          private def attributes(instrument: InstrumentConfig.UpDownCounter): Attributes =
+            config.constAttributes ++ instrument.attributes
+
+          private def attributes(
+              instrument: InstrumentConfig.Histogram
+          ): Resource.ExitCase => Attributes =
+            exitCase => config.constAttributes ++ instrument.attributes(exitCase)
 
           val idleInc: F[Unit] =
             idle.fold(Monad[F].unit) { case (instrument, counter) =>
@@ -371,7 +400,9 @@ object Otel4sMetrics {
 
           val inUseCount: Resource[F, Unit] =
             inUse.fold(Resource.unit[F]) { case (instrument, counter) =>
-              Resource.make(counter.inc(attributes(instrument)))(_ => counter.dec(attributes(instrument)))
+              Resource.make(counter.inc(attributes(instrument)))(_ =>
+                counter.dec(attributes(instrument))
+              )
             }
 
           val inUseRecordDuration: Resource[F, Unit] =

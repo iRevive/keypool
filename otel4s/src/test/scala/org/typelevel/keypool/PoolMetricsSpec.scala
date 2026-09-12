@@ -155,6 +155,59 @@ class PoolMetricsSpec extends CatsEffectSuite {
     }
   }
 
+  test("Histogram attributes can depend on the resource exit case") {
+    val exception = new RuntimeException("Something went wrong") with NoStackTrace
+
+    TestControl.executeEmbed {
+      createTestkit.use { sdk =>
+        implicit val meterProvider: MeterProvider[IO] = sdk.meterProvider
+
+        val config = Otel4sMetrics.Config.default
+          .withConstAttributes(PoolAttributes)
+          .withoutIdle
+          .withoutInUse
+          .withInUseDurationInstrument(
+            Otel4sMetrics.InstrumentConfig.histogram(
+              name = InUseDuration,
+              timeUnit = java.util.concurrent.TimeUnit.SECONDS,
+              description = "For how long a resource is in use.",
+              attributes =
+                exitCase => Attributes(Attribute("pool.exit_case", exitCaseName(exitCase))),
+              explicitBucketBoundaries = HistogramBuckets
+            )
+          )
+          .withoutAcquiredTotal
+          .withoutAcquireDuration
+
+        Pool
+          .Builder(Ref.of[IO, Int](1), nothing)
+          .withMetricsProvider(Otel4sMetrics.provider[IO](config))
+          .withMaxIdle(0)
+          .build
+          .use { pool =>
+            for {
+              _ <- pool.take.use(_ => IO.unit)
+              _ <- pool.take.use(_ => IO.raiseError[Unit](exception)).attempt
+              started <- IO.deferred[Unit]
+              fiber <- pool.take.use(_ => started.complete(()) >> IO.never[Unit]).start
+              _ <- started.get
+              _ <- fiber.cancel
+              metrics <- sdk.collectMetrics
+            } yield assertMetrics(
+              metrics,
+              MetricExpectation
+                .histogram(InUseDuration)
+                .exactlyPoints(
+                  PointExpectation.histogram.attributesExact(exitCaseAttributes("succeeded")),
+                  PointExpectation.histogram.attributesExact(exitCaseAttributes("errored")),
+                  PointExpectation.histogram.attributesExact(exitCaseAttributes("canceled"))
+                )
+            )
+          }
+      }
+    }
+  }
+
   private def poolTest(
       customize: Pool.Builder[IO, Ref[IO, Int]] => Pool.Builder[IO, Ref[IO, Int]] = identity
   )(scenario: (MetricsTestkit[IO], Pool[IO, Ref[IO, Int]]) => IO[Unit]): IO[Unit] =
@@ -249,6 +302,16 @@ class PoolMetricsSpec extends CatsEffectSuite {
 
   private val PoolAttributes: Attributes =
     Attributes(Attribute("pool.name", "test"))
+
+  private def exitCaseAttributes(exitCase: String): Attributes =
+    PoolAttributes + Attribute("pool.exit_case", exitCase)
+
+  private def exitCaseName(exitCase: Resource.ExitCase): String =
+    exitCase match {
+      case Resource.ExitCase.Succeeded => "succeeded"
+      case Resource.ExitCase.Errored(_) => "errored"
+      case Resource.ExitCase.Canceled => "canceled"
+    }
 
   private val Idle = "keypool.idle.current"
   private val InUse = "keypool.in_use.current"
