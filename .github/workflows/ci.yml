@@ -135,7 +135,7 @@ jobs:
         run: sbt +update
 
       - name: Download target directories (2.12, coreJVM)
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: target-${{ matrix.os }}-${{ matrix.java }}-2.12-coreJVM
 
@@ -145,7 +145,7 @@ jobs:
           rm targets.tar
 
       - name: Download target directories (2.12, coreJS)
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: target-${{ matrix.os }}-${{ matrix.java }}-2.12-coreJS
 
@@ -155,7 +155,7 @@ jobs:
           rm targets.tar
 
       - name: Download target directories (2.12, coreNative)
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: target-${{ matrix.os }}-${{ matrix.java }}-2.12-coreNative
 
@@ -165,7 +165,7 @@ jobs:
           rm targets.tar
 
       - name: Download target directories (2.13, coreJVM)
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: target-${{ matrix.os }}-${{ matrix.java }}-2.13-coreJVM
 
@@ -265,7 +265,7 @@ jobs:
           rm targets.tar
 
       - name: Download target directories (3, otel4sJS)
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: target-${{ matrix.os }}-${{ matrix.java }}-3-otel4sJS
 
@@ -275,7 +275,7 @@ jobs:
           rm targets.tar
 
       - name: Download target directories (3, otel4sNative)
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: target-${{ matrix.os }}-${{ matrix.java }}-3-otel4sNative
 
