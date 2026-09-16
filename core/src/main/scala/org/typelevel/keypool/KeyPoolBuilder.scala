@@ -88,11 +88,11 @@ final class KeyPoolBuilder[F[_]: Temporal, A, B] private (
     def keepRunning[Z](fa: F[Z]): F[Z] =
       fa.onError { case e => onReaperException(e) }.attempt >> keepRunning(fa)
     for {
+      kpMetrics <- Resource.pure(Metrics.noop)
       kpVar <- Resource.make(
         Ref[F].of[PoolMap[A, (B, F[Unit])]](PoolMap.open(0, Map.empty[A, PoolList[(B, F[Unit])]]))
-      )(kpVar => KeyPool.destroy(kpVar))
+      )(kpVar => KeyPool.destroy(kpVar, kpMetrics))
       kpMaxTotalSem <- Resource.eval(RequestSemaphore[F](Fairness.Fifo, kpMaxTotal))
-      kpMetrics <- Resource.pure(Metrics.noop)
       _ <- idleTimeAllowedInPool match {
         case fd: FiniteDuration =>
           val nanos = 0.seconds.max(fd)

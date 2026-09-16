@@ -24,42 +24,53 @@ package org.typelevel.keypool.internal
 import cats.Applicative
 import cats.effect.kernel.Resource
 
+/** Pool metrics. Implementations must not fail pool operations. */
 sealed trait Metrics[F[_]] {
 
-  /**
-   * Increments the number of idle resources.
-   */
+  /** Tracks an acquisition until a resource is ready. */
+  def acquire: Resource[F, Metrics.Acquisition[F]]
+
+  /** Adds one idle resource. */
   def idleInc: F[Unit]
 
-  /**
-   * Decrements the number of idle resources.
-   */
+  /** Removes one idle resource. */
   def idleDec: F[Unit]
 
-  /**
-   * Records the number of in-use resources.
-   */
+  /** Tracks a resource while it is in use. */
   def inUseCount: Resource[F, Unit]
 
-  /**
-   * Records for how long the resource has been in use.
-   */
-  def inUseRecordDuration: Resource[F, Unit]
+  /** Records how long a resource is used. */
+  def useDuration: Resource[F, Unit]
 
-  /**
-   * Increments the number of acquired resources.
-   */
-  def acquiredTotalInc: F[Unit]
+  /** Records how long it takes to create a new resource. */
+  def createDuration: Resource[F, Unit]
 
-  /**
-   * Records how long does it take to acquire a resource.
-   */
-  def acquireRecordDuration: Resource[F, Unit]
+  /** Records a resource removed permanently from the pool. */
+  def resourceDestroyed(reason: Metrics.DestructionReason): F[Unit]
 
 }
 
 object Metrics {
   private[keypool] trait Unsealed[F[_]] extends Metrics[F]
+
+  sealed trait DestructionReason extends Product with Serializable
+
+  object DestructionReason {
+    case object IdleTimeout extends DestructionReason
+    case object MaxIdle extends DestructionReason
+    case object MaxPerKey extends DestructionReason
+    case object NotReusable extends DestructionReason
+    case object PoolClosed extends DestructionReason
+  }
+
+  trait Acquisition[F[_]] {
+
+    /** Marks the resource as ready. */
+    def complete: F[Unit]
+
+    /** Finishes an acquisition that did not complete. */
+    private[keypool] def finish(exitCase: Resource.ExitCase): F[Unit]
+  }
 
   trait Provider[F[_]] {
     def get: F[Metrics[F]]
@@ -76,10 +87,15 @@ object Metrics {
     new Metrics[F] {
       def idleInc: F[Unit] = Applicative[F].unit
       def idleDec: F[Unit] = Applicative[F].unit
+      def acquire: Resource[F, Acquisition[F]] =
+        Resource.pure(new Acquisition[F] {
+          def complete: F[Unit] = Applicative[F].unit
+          private[keypool] def finish(exitCase: Resource.ExitCase): F[Unit] = Applicative[F].unit
+        })
       def inUseCount: Resource[F, Unit] = Resource.unit
-      def inUseRecordDuration: Resource[F, Unit] = Resource.unit
-      def acquiredTotalInc: F[Unit] = Applicative[F].unit
-      def acquireRecordDuration: Resource[F, Unit] = Resource.unit
+      def useDuration: Resource[F, Unit] = Resource.unit
+      def createDuration: Resource[F, Unit] = Resource.unit
+      def resourceDestroyed(reason: DestructionReason): F[Unit] = Applicative[F].unit
     }
 
 }

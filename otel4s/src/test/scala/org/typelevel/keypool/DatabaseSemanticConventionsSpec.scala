@@ -58,6 +58,8 @@ class DatabaseSemanticConventionsSpec extends CatsEffectSuite {
         val connectionCountSpec = DbExperimentalMetrics.ClientConnectionCount
         val useTimeSpec = DbExperimentalMetrics.ClientConnectionUseTime
         val waitTimeSpec = DbExperimentalMetrics.ClientConnectionWaitTime
+        val createTimeSpec = DbExperimentalMetrics.ClientConnectionCreateTime
+        val pendingRequestsSpec = DbExperimentalMetrics.ClientConnectionPendingRequests
 
         def connectionCount(state: String): Otel4sMetrics.InstrumentConfig.UpDownCounter =
           Otel4sMetrics.InstrumentConfig.upDownCounter(
@@ -71,7 +73,7 @@ class DatabaseSemanticConventionsSpec extends CatsEffectSuite {
           .withConstAttributes(poolAttributes)
           .withIdleInstrument(connectionCount("idle"))
           .withInUseInstrument(connectionCount("used"))
-          .withInUseDurationInstrument(
+          .withUseDurationInstrument(
             Otel4sMetrics.InstrumentConfig.histogram(
               name = useTimeSpec.name,
               timeUnit = TimeUnit.SECONDS,
@@ -80,7 +82,14 @@ class DatabaseSemanticConventionsSpec extends CatsEffectSuite {
               explicitBucketBoundaries = HistogramBuckets
             )
           )
-          .withoutAcquiredTotal
+          .withPendingAcquireInstrument(
+            Otel4sMetrics.InstrumentConfig.upDownCounter(
+              name = pendingRequestsSpec.name,
+              unit = pendingRequestsSpec.unit,
+              description = pendingRequestsSpec.description,
+              attributes = Attributes.empty
+            )
+          )
           .withAcquireDurationInstrument(
             Otel4sMetrics.InstrumentConfig.histogram(
               name = waitTimeSpec.name,
@@ -90,6 +99,16 @@ class DatabaseSemanticConventionsSpec extends CatsEffectSuite {
               explicitBucketBoundaries = HistogramBuckets
             )
           )
+          .withCreateDurationInstrument(
+            Otel4sMetrics.InstrumentConfig.histogram(
+              name = createTimeSpec.name,
+              timeUnit = TimeUnit.SECONDS,
+              description = createTimeSpec.description,
+              attributes = Attributes.empty,
+              explicitBucketBoundaries = HistogramBuckets
+            )
+          )
+          .withoutDestroyed
 
         Pool
           .Builder(Ref.of[IO, Int](1), nothing)
@@ -114,18 +133,29 @@ class DatabaseSemanticConventionsSpec extends CatsEffectSuite {
                       .counts(1L, 0L, 0L, 0L, 0L)
                       .attributesExact(poolAttributes)
                   )
+                val createTime = semanticHistogram(createTimeSpec)
+                  .exactlyPoints(
+                    PointExpectation.histogram
+                      .stats(PointData.Histogram.Stats(0.0, 0.0, 0.0, 1))
+                      .boundaries(HistogramBuckets)
+                      .counts(1L, 0L, 0L, 0L, 0L)
+                      .attributesExact(poolAttributes)
+                  )
+                val pendingRequests = semanticSum(pendingRequestsSpec)
+                  .exactlyPoints(PointExpectation.numeric(0L).attributesExact(poolAttributes))
 
-                assertNotEmitted(inUse, useTimeSpec.name, AcquiredTotal)
+                assertNotEmitted(inUse, useTimeSpec.name)
                 assertMetrics(
                   inUse,
                   semanticSum(connectionCountSpec)
                     .exactlyPoints(
                       PointExpectation.numeric(1L).attributesExact(usedAttributes)
                     ),
-                  waitTime
+                  pendingRequests,
+                  waitTime,
+                  createTime
                 )
 
-                assertNotEmitted(afterUse, AcquiredTotal)
                 assertMetrics(
                   afterUse,
                   semanticSum(connectionCountSpec)
@@ -133,6 +163,7 @@ class DatabaseSemanticConventionsSpec extends CatsEffectSuite {
                       PointExpectation.numeric(1L).attributesExact(idleAttributes),
                       PointExpectation.numeric(0L).attributesExact(usedAttributes)
                     ),
+                  pendingRequests,
                   semanticHistogram(useTimeSpec)
                     .exactlyPoints(
                       PointExpectation.histogram
@@ -141,7 +172,8 @@ class DatabaseSemanticConventionsSpec extends CatsEffectSuite {
                         .counts(0L, 1L, 0L, 0L, 0L)
                         .attributesExact(poolAttributes)
                     ),
-                  waitTime
+                  waitTime,
+                  createTime
                 )
               }
           }
@@ -201,8 +233,6 @@ class DatabaseSemanticConventionsSpec extends CatsEffectSuite {
 
   private val HistogramBuckets: BucketBoundaries =
     BucketBoundaries(Vector(0.01, 1.0, 100.0, 1000.0))
-
-  private val AcquiredTotal = "keypool.acquired.total"
 
   private def nothing(ref: Ref[IO, Int]): IO[Unit] =
     ref.get.void

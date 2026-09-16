@@ -54,8 +54,8 @@ class PoolMetricsSpec extends CatsEffectSuite {
         inUse <- pool.take.surround(sdk.collectMetrics)
         afterUse <- sdk.collectMetrics
       } yield {
-        assertMetrics(inUse, currentMetric(InUse, 1L))
-        assertMetrics(afterUse, currentMetric(InUse, 0L))
+        assertMetrics(inUse, resourceCount("used" -> 1L))
+        assertMetrics(afterUse, resourceCount("idle" -> 1L, "used" -> 0L))
       }
     }
   }
@@ -72,8 +72,8 @@ class PoolMetricsSpec extends CatsEffectSuite {
         inUse <- deferred.get
         afterUse <- sdk.collectMetrics
       } yield {
-        assertMetrics(inUse, currentMetric(InUse, 1L))
-        assertMetrics(afterUse, currentMetric(InUse, 0L))
+        assertMetrics(inUse, resourceCount("used" -> 1L))
+        assertMetrics(afterUse, resourceCount("idle" -> 1L, "used" -> 0L))
       }
     }
   }
@@ -84,8 +84,12 @@ class PoolMetricsSpec extends CatsEffectSuite {
         inUse <- pool.take.surround(sdk.collectMetrics)
         afterUse <- sdk.collectMetrics
       } yield {
-        assertNotEmitted(inUse, Idle)
-        assertNotEmitted(afterUse, Idle)
+        assertMetrics(inUse, resourceCount("used" -> 1L))
+        assertMetrics(
+          afterUse,
+          resourceCount("used" -> 0L),
+          destroyedMetric("max_idle", 1L)
+        )
       }
     }
   }
@@ -96,8 +100,8 @@ class PoolMetricsSpec extends CatsEffectSuite {
         inUse <- pool.take.surround(sdk.collectMetrics)
         afterUse <- sdk.collectMetrics
       } yield {
-        assertNotEmitted(inUse, Idle)
-        assertMetrics(afterUse, currentMetric(Idle, 1L))
+        assertMetrics(inUse, resourceCount("used" -> 1L))
+        assertMetrics(afterUse, resourceCount("idle" -> 1L, "used" -> 0L))
       }
     }
   }
@@ -109,12 +113,79 @@ class PoolMetricsSpec extends CatsEffectSuite {
         afterUse <- sdk.collectMetrics
         afterSleep <- sdk.collectMetrics.delayBy(6.seconds)
       } yield {
-        assertNotEmitted(inUse, Idle)
-        assertMetrics(afterUse, currentMetric(Idle, 1L))
-        assertMetrics(afterSleep, currentMetric(Idle, 0L))
+        assertMetrics(inUse, resourceCount("used" -> 1L))
+        assertMetrics(afterUse, resourceCount("idle" -> 1L, "used" -> 0L))
+        assertMetrics(
+          afterSleep,
+          resourceCount("idle" -> 0L, "used" -> 0L),
+          destroyedMetric("idle_timeout", 1L)
+        )
       }
     }
 
+  }
+
+  test("Resource count remains accurate when an idle resource is reused") {
+    poolTest(_.withMaxIdle(1)) { (sdk, pool) =>
+      for {
+        _ <- pool.take.use_ // create and return one idle resource
+        duringReuse <- pool.take.surround(sdk.collectMetrics)
+        afterReuse <- sdk.collectMetrics
+      } yield {
+        assertMetrics(duringReuse, resourceCount("idle" -> 0L, "used" -> 1L))
+        assertMetrics(afterReuse, resourceCount("idle" -> 1L, "used" -> 0L))
+      }
+    }
+  }
+
+  test("Resource count returns to zero when the pool closes") {
+    TestControl.executeEmbed {
+      createTestkit.use { sdk =>
+        implicit val meterProvider: MeterProvider[IO] = sdk.meterProvider
+        for {
+          _ <- Pool
+            .Builder(Ref.of[IO, Int](1), nothing)
+            .withMetricsProvider(metricsProvider)
+            .withMaxIdle(1)
+            .build
+            .use(_.take.use_)
+          afterClose <- sdk.collectMetrics
+        } yield assertMetrics(
+          afterClose,
+          resourceCount("idle" -> 0L, "used" -> 0L),
+          destroyedMetric("pool_closed", 1L)
+        )
+      }
+    }
+  }
+
+  test("Pending count and acquire duration include time waiting for a permit") {
+    poolTest(_.withMaxTotal(1).withMaxIdle(1)) { (sdk, pool) =>
+      for {
+        holderStarted <- IO.deferred[Unit]
+        releaseHolder <- IO.deferred[Unit]
+        holder <- pool.take.use(_ => holderStarted.complete(()) >> releaseHolder.get).start
+        _ <- holderStarted.get
+        waiter <- pool.take.use_.start
+        pending <- sdk.collectMetrics.delayBy(1.second)
+        _ <- releaseHolder.complete(())
+        _ <- holder.joinWithNever
+        _ <- waiter.joinWithNever
+        completed <- sdk.collectMetrics
+      } yield {
+        assertMetrics(pending, currentMetric(PendingAcquire, 1L))
+        assertMetrics(
+          completed,
+          currentMetric(PendingAcquire, 0L),
+          histogramMetric(
+            AcquireDuration,
+            TimeWindow(Duration.Zero, 1.second),
+            PointData.Histogram.Stats(1.0, 0.0, 1.0, 2),
+            List(1, 1, 0, 0, 0)
+          )
+        )
+      }
+    }
   }
 
   test("Generate valid metrics") {
@@ -129,27 +200,34 @@ class PoolMetricsSpec extends CatsEffectSuite {
             PointData.Histogram.Stats(0.0, 0.0, 0.0, 1),
             List(1, 0, 0, 0, 0)
           )
+          val createDuration = histogramMetric(
+            CreateDuration,
+            TimeWindow(Duration.Zero, 1.second),
+            PointData.Histogram.Stats(0.0, 0.0, 0.0, 1),
+            List(1, 0, 0, 0, 0)
+          )
 
-          assertNotEmitted(inUse, Idle, InUseDuration)
+          assertNotEmitted(inUse, UseDuration)
           assertMetrics(
             inUse,
-            currentMetric(InUse, 1L),
-            currentMetric(AcquiredTotal, 1L),
-            acquireDuration
+            resourceCount("used" -> 1L),
+            currentMetric(PendingAcquire, 0L),
+            acquireDuration,
+            createDuration
           )
 
           assertMetrics(
             afterUse,
-            currentMetric(Idle, 1L),
-            currentMetric(InUse, 0L),
+            resourceCount("idle" -> 1L, "used" -> 0L),
+            currentMetric(PendingAcquire, 0L),
             histogramMetric(
-              InUseDuration,
+              UseDuration,
               TimeWindow(Duration.Zero, 1.second),
               PointData.Histogram.Stats(1.0, 1.0, 1.0, 1),
               List(0, 1, 0, 0, 0)
             ),
-            currentMetric(AcquiredTotal, 1L),
-            acquireDuration
+            acquireDuration,
+            createDuration
           )
         }
     }
@@ -166,9 +244,9 @@ class PoolMetricsSpec extends CatsEffectSuite {
           .withConstAttributes(PoolAttributes)
           .withoutIdle
           .withoutInUse
-          .withInUseDurationInstrument(
+          .withUseDurationInstrument(
             Otel4sMetrics.InstrumentConfig.histogram(
-              name = InUseDuration,
+              name = UseDuration,
               timeUnit = java.util.concurrent.TimeUnit.SECONDS,
               description = "For how long a resource is in use.",
               attributes =
@@ -176,8 +254,10 @@ class PoolMetricsSpec extends CatsEffectSuite {
               explicitBucketBoundaries = HistogramBuckets
             )
           )
-          .withoutAcquiredTotal
+          .withoutPendingAcquire
           .withoutAcquireDuration
+          .withoutCreateDuration
+          .withoutDestroyed
 
         Pool
           .Builder(Ref.of[IO, Int](1), nothing)
@@ -196,7 +276,7 @@ class PoolMetricsSpec extends CatsEffectSuite {
             } yield assertMetrics(
               metrics,
               MetricExpectation
-                .histogram(InUseDuration)
+                .histogram(UseDuration)
                 .exactlyPoints(
                   PointExpectation.histogram.attributesExact(exitCaseAttributes("succeeded")),
                   PointExpectation.histogram.attributesExact(exitCaseAttributes("errored")),
@@ -238,9 +318,9 @@ class PoolMetricsSpec extends CatsEffectSuite {
     Otel4sMetrics.provider[IO](
       Otel4sMetrics.Config.default
         .withConstAttributes(PoolAttributes)
-        .withInUseDurationInstrument(
+        .withUseDurationInstrument(
           Otel4sMetrics.InstrumentConfig.histogram(
-            name = InUseDuration,
+            name = UseDuration,
             timeUnit = java.util.concurrent.TimeUnit.SECONDS,
             description = "For how long a resource is in use.",
             attributes = Attributes.empty,
@@ -252,6 +332,15 @@ class PoolMetricsSpec extends CatsEffectSuite {
             name = AcquireDuration,
             timeUnit = java.util.concurrent.TimeUnit.SECONDS,
             description = "How long does it take to acquire a resource.",
+            attributes = Attributes.empty,
+            explicitBucketBoundaries = HistogramBuckets
+          )
+        )
+        .withCreateDurationInstrument(
+          Otel4sMetrics.InstrumentConfig.histogram(
+            name = CreateDuration,
+            timeUnit = java.util.concurrent.TimeUnit.SECONDS,
+            description = "How long does it take to create a resource.",
             attributes = Attributes.empty,
             explicitBucketBoundaries = HistogramBuckets
           )
@@ -279,6 +368,24 @@ class PoolMetricsSpec extends CatsEffectSuite {
     MetricExpectation
       .sum[Long](name)
       .exactlyPoints(PointExpectation.numeric(value).attributesExact(PoolAttributes))
+
+  private def resourceCount(points: (String, Long)*): MetricExpectation = {
+    val expected = points.map { case (state, value) =>
+      PointExpectation
+        .numeric(value)
+        .attributesExact(PoolAttributes + Attribute("keypool.resource.state", state))
+    }
+    MetricExpectation.sum[Long](ResourceCount).exactlyPoints(expected.head, expected.tail*)
+  }
+
+  private def destroyedMetric(reason: String, value: Long): MetricExpectation =
+    MetricExpectation
+      .sum[Long](Destroyed)
+      .exactlyPoints(
+        PointExpectation
+          .numeric(value)
+          .attributesExact(PoolAttributes + Attribute("keypool.destroy.reason", reason))
+      )
 
   private def histogramMetric(
       name: String,
@@ -313,11 +420,12 @@ class PoolMetricsSpec extends CatsEffectSuite {
       case Resource.ExitCase.Canceled => "canceled"
     }
 
-  private val Idle = "keypool.idle.current"
-  private val InUse = "keypool.in_use.current"
-  private val InUseDuration = "keypool.in_use.duration"
-  private val AcquiredTotal = "keypool.acquired.total"
+  private val ResourceCount = "keypool.resource.count"
+  private val UseDuration = "keypool.resource.use.duration"
+  private val PendingAcquire = "keypool.acquire.pending"
   private val AcquireDuration = "keypool.acquire.duration"
+  private val CreateDuration = "keypool.resource.create.duration"
+  private val Destroyed = "keypool.resource.destroyed"
 
   private def nothing(ref: Ref[IO, Int]): IO[Unit] =
     ref.get.void

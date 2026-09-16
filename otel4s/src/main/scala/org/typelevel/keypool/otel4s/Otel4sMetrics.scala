@@ -23,14 +23,15 @@ package org.typelevel.keypool.otel4s
 
 import java.util.concurrent.TimeUnit
 
-import cats.Monad
-import cats.effect.kernel.Resource
+import cats.effect.kernel.{Clock, Ref, Resource, Temporal}
 import cats.syntax.flatMap.*
 import cats.syntax.functor.*
 import cats.syntax.traverse.*
 import org.typelevel.keypool.internal.Metrics
 import org.typelevel.otel4s.{Attribute, Attributes}
-import org.typelevel.otel4s.metrics.{BucketBoundaries, MeterProvider}
+import org.typelevel.otel4s.metrics.{BucketBoundaries, Histogram, MeterProvider}
+
+import scala.concurrent.duration.FiniteDuration
 
 object Otel4sMetrics {
 
@@ -50,11 +51,11 @@ object Otel4sMetrics {
 
   object InstrumentConfig {
 
-    /** Counter configuration. */
+    /** Resource-destruction counter configuration. */
     sealed trait Counter extends InstrumentConfig {
 
-      /** Attributes added to each measurement. */
-      def attributes: Attributes
+      /** Attributes added to each measurement, based on why the resource was destroyed. */
+      def attributes: Metrics.DestructionReason => Attributes
     }
 
     /** Up-down counter configuration. */
@@ -88,15 +89,6 @@ object Otel4sMetrics {
         }
     }
 
-    /** Creates a counter configuration. */
-    def counter(
-        name: String,
-        unit: String,
-        description: String,
-        attributes: Attributes
-    ): Counter =
-      CounterImpl(name, unit, description, attributes)
-
     /** Creates an up-down counter configuration. */
     def upDownCounter(
         name: String,
@@ -105,6 +97,24 @@ object Otel4sMetrics {
         attributes: Attributes
     ): UpDownCounter =
       UpDownCounterImpl(name, unit, description, attributes)
+
+    /** Creates a resource-destruction counter configuration. */
+    def counter(
+        name: String,
+        unit: String,
+        description: String,
+        attributes: Attributes
+    ): Counter =
+      counter(name, unit, description, _ => attributes)
+
+    /** Creates a resource-destruction counter with reason-dependent attributes. */
+    def counter(
+        name: String,
+        unit: String,
+        description: String,
+        attributes: Metrics.DestructionReason => Attributes
+    ): Counter =
+      CounterImpl(name, unit, description, attributes)
 
     /** Creates a duration histogram configuration. */
     def histogram(
@@ -126,19 +136,19 @@ object Otel4sMetrics {
     ): Histogram =
       HistogramImpl(name, timeUnit, description, attributes, explicitBucketBoundaries)
 
-    private final case class CounterImpl(
-        name: String,
-        unit: String,
-        description: String,
-        attributes: Attributes
-    ) extends Counter
-
     private final case class UpDownCounterImpl(
         name: String,
         unit: String,
         description: String,
         attributes: Attributes
     ) extends UpDownCounter
+
+    private final case class CounterImpl(
+        name: String,
+        unit: String,
+        description: String,
+        attributes: Metrics.DestructionReason => Attributes
+    ) extends Counter
 
     private final case class HistogramImpl(
         name: String,
@@ -156,9 +166,11 @@ object Otel4sMetrics {
     private[otel4s] def constAttributes: Attributes
     private[otel4s] def idleInstrument: Option[InstrumentConfig.UpDownCounter]
     private[otel4s] def inUseInstrument: Option[InstrumentConfig.UpDownCounter]
-    private[otel4s] def inUseDurationInstrument: Option[InstrumentConfig.Histogram]
-    private[otel4s] def acquiredTotalInstrument: Option[InstrumentConfig.Counter]
+    private[otel4s] def useDurationInstrument: Option[InstrumentConfig.Histogram]
+    private[otel4s] def pendingAcquireInstrument: Option[InstrumentConfig.UpDownCounter]
     private[otel4s] def acquireDurationInstrument: Option[InstrumentConfig.Histogram]
+    private[otel4s] def createDurationInstrument: Option[InstrumentConfig.Histogram]
+    private[otel4s] def destroyedInstrument: Option[InstrumentConfig.Counter]
 
     /** Replaces the constant attributes attached to every measurement. */
     def withConstAttributes(attributes: Attributes): Config
@@ -179,22 +191,34 @@ object Otel4sMetrics {
     def withoutInUse: Config
 
     /** Replaces the in-use-duration instrument. */
-    def withInUseDurationInstrument(instrument: InstrumentConfig.Histogram): Config
+    def withUseDurationInstrument(instrument: InstrumentConfig.Histogram): Config
 
     /** Disables the in-use-duration instrument. */
-    def withoutInUseDuration: Config
+    def withoutUseDuration: Config
 
-    /** Replaces the acquired-resource counter. */
-    def withAcquiredTotalInstrument(instrument: InstrumentConfig.Counter): Config
+    /** Replaces the pending-acquisition instrument. */
+    def withPendingAcquireInstrument(instrument: InstrumentConfig.UpDownCounter): Config
 
-    /** Disables the acquired-resource counter. */
-    def withoutAcquiredTotal: Config
+    /** Disables the pending-acquisition instrument. */
+    def withoutPendingAcquire: Config
 
     /** Replaces the acquire-duration instrument. */
     def withAcquireDurationInstrument(instrument: InstrumentConfig.Histogram): Config
 
     /** Disables the acquire-duration instrument. */
     def withoutAcquireDuration: Config
+
+    /** Replaces the resource-creation-duration instrument. */
+    def withCreateDurationInstrument(instrument: InstrumentConfig.Histogram): Config
+
+    /** Disables the resource-creation-duration instrument. */
+    def withoutCreateDuration: Config
+
+    /** Replaces the resource-destruction counter. */
+    def withDestroyedInstrument(instrument: InstrumentConfig.Counter): Config
+
+    /** Disables the resource-destruction counter. */
+    def withoutDestroyed: Config
   }
 
   object Config {
@@ -208,34 +232,34 @@ object Otel4sMetrics {
 
       val idleInstrument: InstrumentConfig.UpDownCounter =
         InstrumentConfig.upDownCounter(
-          name = "keypool.idle.current",
+          name = "keypool.resource.count",
           unit = "{resource}",
-          description = "A current number of idle resources.",
-          attributes = Attributes.empty
+          description = "The number of resources currently in the pool, by state.",
+          attributes = Attributes(Attribute("keypool.resource.state", "idle"))
         )
 
       val inUseInstrument: InstrumentConfig.UpDownCounter =
         InstrumentConfig.upDownCounter(
-          name = "keypool.in_use.current",
+          name = "keypool.resource.count",
           unit = "{resource}",
-          description = "A current number of resources in use.",
-          attributes = Attributes.empty
+          description = "The number of resources currently in the pool, by state.",
+          attributes = Attributes(Attribute("keypool.resource.state", "used"))
         )
 
-      val inUseDurationInstrument: InstrumentConfig.Histogram =
+      val useDurationInstrument: InstrumentConfig.Histogram =
         InstrumentConfig.histogram(
-          name = "keypool.in_use.duration",
+          name = "keypool.resource.use.duration",
           timeUnit = TimeUnit.SECONDS,
-          description = "For how long a resource is in use.",
+          description = "The duration between borrowing a resource and returning it to the pool.",
           attributes = Attributes.empty,
           explicitBucketBoundaries = histogramBucketBoundaries
         )
 
-      val acquiredTotalInstrument: InstrumentConfig.Counter =
-        InstrumentConfig.counter(
-          name = "keypool.acquired.total",
-          unit = "{resource}",
-          description = "A total number of acquired resources.",
+      val pendingAcquireInstrument: InstrumentConfig.UpDownCounter =
+        InstrumentConfig.upDownCounter(
+          name = "keypool.acquire.pending",
+          unit = "{request}",
+          description = "The number of requests currently waiting to acquire a resource.",
           attributes = Attributes.empty
         )
 
@@ -243,10 +267,36 @@ object Otel4sMetrics {
         InstrumentConfig.histogram(
           name = "keypool.acquire.duration",
           timeUnit = TimeUnit.SECONDS,
-          description = "How long does it take to acquire a resource.",
+          description = "The time it took to obtain a resource from the pool.",
           attributes = Attributes.empty,
           explicitBucketBoundaries = histogramBucketBoundaries
         )
+
+      val createDurationInstrument: InstrumentConfig.Histogram =
+        InstrumentConfig.histogram(
+          name = "keypool.resource.create.duration",
+          timeUnit = TimeUnit.SECONDS,
+          description = "The time it took to create a new resource.",
+          attributes = Attributes.empty,
+          explicitBucketBoundaries = histogramBucketBoundaries
+        )
+
+      val destroyedInstrument: InstrumentConfig.Counter =
+        InstrumentConfig.counter(
+          name = "keypool.resource.destroyed",
+          unit = "{resource}",
+          description = "The number of resources removed permanently from the pool.",
+          attributes = reason => Attributes(Attribute("keypool.destroy.reason", reasonName(reason)))
+        )
+
+      private def reasonName(reason: Metrics.DestructionReason): String =
+        reason match {
+          case Metrics.DestructionReason.IdleTimeout => "idle_timeout"
+          case Metrics.DestructionReason.MaxIdle => "max_idle"
+          case Metrics.DestructionReason.MaxPerKey => "max_per_key"
+          case Metrics.DestructionReason.NotReusable => "not_reusable"
+          case Metrics.DestructionReason.PoolClosed => "pool_closed"
+        }
     }
 
     /** Default metrics configuration. */
@@ -256,9 +306,11 @@ object Otel4sMetrics {
         constAttributes = Attributes.empty,
         idleInstrument = Some(Defaults.idleInstrument),
         inUseInstrument = Some(Defaults.inUseInstrument),
-        inUseDurationInstrument = Some(Defaults.inUseDurationInstrument),
-        acquiredTotalInstrument = Some(Defaults.acquiredTotalInstrument),
-        acquireDurationInstrument = Some(Defaults.acquireDurationInstrument)
+        useDurationInstrument = Some(Defaults.useDurationInstrument),
+        pendingAcquireInstrument = Some(Defaults.pendingAcquireInstrument),
+        acquireDurationInstrument = Some(Defaults.acquireDurationInstrument),
+        createDurationInstrument = Some(Defaults.createDurationInstrument),
+        destroyedInstrument = Some(Defaults.destroyedInstrument)
       )
 
     private final case class ConfigImpl(
@@ -266,9 +318,11 @@ object Otel4sMetrics {
         constAttributes: Attributes,
         idleInstrument: Option[InstrumentConfig.UpDownCounter],
         inUseInstrument: Option[InstrumentConfig.UpDownCounter],
-        inUseDurationInstrument: Option[InstrumentConfig.Histogram],
-        acquiredTotalInstrument: Option[InstrumentConfig.Counter],
-        acquireDurationInstrument: Option[InstrumentConfig.Histogram]
+        useDurationInstrument: Option[InstrumentConfig.Histogram],
+        pendingAcquireInstrument: Option[InstrumentConfig.UpDownCounter],
+        acquireDurationInstrument: Option[InstrumentConfig.Histogram],
+        createDurationInstrument: Option[InstrumentConfig.Histogram],
+        destroyedInstrument: Option[InstrumentConfig.Counter]
     ) extends Config {
 
       def withConstAttributes(attributes: Attributes): Config =
@@ -289,23 +343,35 @@ object Otel4sMetrics {
       def withoutInUse: Config =
         copy(inUseInstrument = None)
 
-      def withInUseDurationInstrument(instrument: InstrumentConfig.Histogram): Config =
-        copy(inUseDurationInstrument = Some(instrument))
+      def withUseDurationInstrument(instrument: InstrumentConfig.Histogram): Config =
+        copy(useDurationInstrument = Some(instrument))
 
-      def withoutInUseDuration: Config =
-        copy(inUseDurationInstrument = None)
+      def withoutUseDuration: Config =
+        copy(useDurationInstrument = None)
 
-      def withAcquiredTotalInstrument(instrument: InstrumentConfig.Counter): Config =
-        copy(acquiredTotalInstrument = Some(instrument))
+      def withPendingAcquireInstrument(instrument: InstrumentConfig.UpDownCounter): Config =
+        copy(pendingAcquireInstrument = Some(instrument))
 
-      def withoutAcquiredTotal: Config =
-        copy(acquiredTotalInstrument = None)
+      def withoutPendingAcquire: Config =
+        copy(pendingAcquireInstrument = None)
 
       def withAcquireDurationInstrument(instrument: InstrumentConfig.Histogram): Config =
         copy(acquireDurationInstrument = Some(instrument))
 
       def withoutAcquireDuration: Config =
         copy(acquireDurationInstrument = None)
+
+      def withCreateDurationInstrument(instrument: InstrumentConfig.Histogram): Config =
+        copy(createDurationInstrument = Some(instrument))
+
+      def withoutCreateDuration: Config =
+        copy(createDurationInstrument = None)
+
+      def withDestroyedInstrument(instrument: InstrumentConfig.Counter): Config =
+        copy(destroyedInstrument = Some(instrument))
+
+      def withoutDestroyed: Config =
+        copy(destroyedInstrument = None)
     }
 
   }
@@ -321,7 +387,7 @@ object Otel4sMetrics {
    * Otel4sMetrics.provider[IO](config)
    *   }}}
    */
-  def provider[F[_]: Monad: MeterProvider](
+  def provider[F[_]: Temporal: MeterProvider](
       config: Config
   ): Metrics.Provider[F] =
     new Metrics.Provider[F] {
@@ -347,7 +413,7 @@ object Otel4sMetrics {
               .tupleLeft(instrument)
           }
 
-          inUseDuration <- config.inUseDurationInstrument.traverse { instrument =>
+          useDuration <- config.useDurationInstrument.traverse { instrument =>
             meter
               .histogram[Double](instrument.name)
               .withUnit(instrument.unit)
@@ -357,9 +423,9 @@ object Otel4sMetrics {
               .tupleLeft(instrument)
           }
 
-          acquiredTotal <- config.acquiredTotalInstrument.traverse { instrument =>
+          pendingAcquire <- config.pendingAcquireInstrument.traverse { instrument =>
             meter
-              .counter[Long](instrument.name)
+              .upDownCounter[Long](instrument.name)
               .withUnit(instrument.unit)
               .withDescription(instrument.description)
               .create
@@ -375,26 +441,101 @@ object Otel4sMetrics {
               .create
               .tupleLeft(instrument)
           }
-        } yield new Metrics.Unsealed[F] {
 
-          private def attributes(instrument: InstrumentConfig.Counter): Attributes =
-            config.constAttributes ++ instrument.attributes
+          createDuration <- config.createDurationInstrument.traverse { instrument =>
+            meter
+              .histogram[Double](instrument.name)
+              .withUnit(instrument.unit)
+              .withDescription(instrument.description)
+              .withExplicitBucketBoundaries(instrument.explicitBucketBoundaries)
+              .create
+              .tupleLeft(instrument)
+          }
+
+          destroyed <- config.destroyedInstrument.traverse { instrument =>
+            meter
+              .counter[Long](instrument.name)
+              .withUnit(instrument.unit)
+              .withDescription(instrument.description)
+              .create
+              .tupleLeft(instrument)
+          }
+        } yield new Metrics.Unsealed[F] {
 
           private def attributes(instrument: InstrumentConfig.UpDownCounter): Attributes =
             config.constAttributes ++ instrument.attributes
+
+          private def attributes(
+              instrument: InstrumentConfig.Counter,
+              reason: Metrics.DestructionReason
+          ): Attributes =
+            config.constAttributes ++ instrument.attributes(reason)
 
           private def attributes(
               instrument: InstrumentConfig.Histogram
           ): Resource.ExitCase => Attributes =
             exitCase => config.constAttributes ++ instrument.attributes(exitCase)
 
+          private def recordElapsed(
+              histogram: Option[(InstrumentConfig.Histogram, Histogram[F, Double])],
+              startedAt: FiniteDuration,
+              exitCase: Resource.ExitCase
+          ): F[Unit] =
+            histogram.fold(Temporal[F].unit) { case (instrument, histogram) =>
+              Clock[F].monotonic.flatMap { finishedAt =>
+                val duration =
+                  (finishedAt - startedAt).toNanos.toDouble / instrument.timeUnit
+                    .toNanos(1L)
+                    .toDouble
+                histogram.record(duration, attributes(instrument)(exitCase))
+              }
+            }
+
+          /**
+           * Completes when the resource is ready, while the finalizer covers failed or canceled
+           * acquisitions. We cannot rely on the finalizer alone because it runs when the borrowed
+           * resource is returned, which would include use time and keep the pending count elevated.
+           * The guard ensures the metrics are recorded only once.
+           */
+          val acquire: Resource[F, Metrics.Acquisition[F]] =
+            for {
+              startedAt <- Resource.eval(Clock[F].monotonic)
+              completed <- Resource.eval(Ref.of[F, Boolean](false))
+              _ <- Resource.eval(
+                pendingAcquire.fold(Temporal[F].unit) { case (instrument, counter) =>
+                  counter.inc(attributes(instrument))
+                }
+              )
+              acquisition = new Metrics.Acquisition[F] {
+                def complete: F[Unit] =
+                  finish(Resource.ExitCase.Succeeded)
+
+                private[keypool] def finish(exitCase: Resource.ExitCase): F[Unit] =
+                  Temporal[F].uncancelable { _ =>
+                    completed.flatModify {
+                      case true => (true, Temporal[F].unit)
+                      case false =>
+                        val decrementPending =
+                          pendingAcquire.fold(Temporal[F].unit) { case (instrument, counter) =>
+                            counter.dec(attributes(instrument))
+                          }
+                        (
+                          true,
+                          decrementPending >> recordElapsed(acquireDuration, startedAt, exitCase)
+                        )
+                    }
+                  }
+              }
+              _ <- Resource.onFinalizeCase(acquisition.finish)
+            } yield acquisition
+
           val idleInc: F[Unit] =
-            idle.fold(Monad[F].unit) { case (instrument, counter) =>
+            idle.fold(Temporal[F].unit) { case (instrument, counter) =>
               counter.inc(attributes(instrument))
             }
 
           val idleDec: F[Unit] =
-            idle.fold(Monad[F].unit) { case (instrument, counter) =>
+            idle.fold(Temporal[F].unit) { case (instrument, counter) =>
               counter.dec(attributes(instrument))
             }
 
@@ -405,19 +546,19 @@ object Otel4sMetrics {
               )
             }
 
-          val inUseRecordDuration: Resource[F, Unit] =
-            inUseDuration.fold(Resource.unit[F]) { case (instrument, histogram) =>
+          val useDuration: Resource[F, Unit] =
+            useDuration.fold(Resource.unit[F]) { case (instrument, histogram) =>
               histogram.recordDuration(instrument.timeUnit, attributes(instrument))
             }
 
-          val acquiredTotalInc: F[Unit] =
-            acquiredTotal.fold(Monad[F].unit) { case (instrument, counter) =>
-              counter.inc(attributes(instrument))
+          val createDuration: Resource[F, Unit] =
+            createDuration.fold(Resource.unit[F]) { case (instrument, histogram) =>
+              histogram.recordDuration(instrument.timeUnit, attributes(instrument))
             }
 
-          val acquireRecordDuration: Resource[F, Unit] =
-            acquireDuration.fold(Resource.unit[F]) { case (instrument, histogram) =>
-              histogram.recordDuration(instrument.timeUnit, attributes(instrument))
+          def resourceDestroyed(reason: Metrics.DestructionReason): F[Unit] =
+            destroyed.fold(Temporal[F].unit) { case (instrument, counter) =>
+              counter.inc(attributes(instrument, reason))
             }
         }
     }
