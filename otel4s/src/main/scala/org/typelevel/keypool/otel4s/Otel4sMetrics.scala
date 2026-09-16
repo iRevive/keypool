@@ -413,7 +413,7 @@ object Otel4sMetrics {
               .tupleLeft(instrument)
           }
 
-          useDuration <- config.useDurationInstrument.traverse { instrument =>
+          useDurationHistogram <- config.useDurationInstrument.traverse { instrument =>
             meter
               .histogram[Double](instrument.name)
               .withUnit(instrument.unit)
@@ -442,7 +442,7 @@ object Otel4sMetrics {
               .tupleLeft(instrument)
           }
 
-          createDuration <- config.createDurationInstrument.traverse { instrument =>
+          createDurationHistogram <- config.createDurationInstrument.traverse { instrument =>
             meter
               .histogram[Double](instrument.name)
               .withUnit(instrument.unit)
@@ -547,12 +547,12 @@ object Otel4sMetrics {
             }
 
           val useDuration: Resource[F, Unit] =
-            useDuration.fold(Resource.unit[F]) { case (instrument, histogram) =>
+            useDurationHistogram.fold(Resource.unit[F]) { case (instrument, histogram) =>
               histogram.recordDuration(instrument.timeUnit, attributes(instrument))
             }
 
           val createDuration: Resource[F, Unit] =
-            createDuration.fold(Resource.unit[F]) { case (instrument, histogram) =>
+            createDurationHistogram.fold(Resource.unit[F]) { case (instrument, histogram) =>
               histogram.recordDuration(instrument.timeUnit, attributes(instrument))
             }
 
